@@ -33,7 +33,7 @@ use matrix_sdk::{
         ClientId, OAuthAuthorizationData, OAuthError as SdkOAuthError, OAuthSession,
     },
     deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
-    event_cache::SearchBackfillStrategy,
+    event_cache::{RoomBackfillRun, SearchBackfillPriority, SearchBackfillStrategy},
     executor::AbortOnDrop,
     media::{
         DefaultMediaFetcher, MediaFormat, MediaRequestParameters, MediaRetentionPolicy,
@@ -2463,6 +2463,30 @@ impl Client {
                 event_cache.run_search_backfill(strategy).await;
             }
         })))
+    }
+
+    /// Back-paginate a single room to populate the search index.
+    ///
+    /// Runs for at most `max_batches` batches (30 events each) at the given
+    /// priority. Call it again while the returned status is `MoreToLoad`,
+    /// until it returns `ReachedStart`.
+    ///
+    /// Requires `ClientBuilder::enable_automatic_back_pagination` and
+    /// `ClientBuilder::enable_event_cache`, otherwise the status is `Failed`.
+    pub async fn index_room_history(
+        &self,
+        room_id: String,
+        priority: SearchBackfillPriority,
+        max_batches: u32,
+    ) -> Result<RoomBackfillRun, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        let event_cache = self
+            .inner
+            .event_cache()
+            .ok_or_else(|| ClientError::from(anyhow::anyhow!("the event cache is not enabled")))?;
+
+        Ok(event_cache.backfill_room_history(&room_id, priority, max_batches as usize).await)
     }
 
     pub fn homeserver_capabilities(&self) -> HomeserverCapabilities {

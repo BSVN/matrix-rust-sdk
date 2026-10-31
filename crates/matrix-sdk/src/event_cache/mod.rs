@@ -87,7 +87,9 @@ pub use self::{
         subscriber::Subscriber,
         thread::{ThreadEventCache, ThreadEventCacheUpdate, pagination::ThreadPagination},
     },
-    search_backfill::SearchBackfillStrategy,
+    search_backfill::{
+        RoomBackfillRun, RoomBackfillStatus, SearchBackfillPriority, SearchBackfillStrategy,
+    },
 };
 use self::{
     caches::{Caches, room::RoomEventCacheLinkedChunkUpdate, subscriber::AutoShrinkMessage},
