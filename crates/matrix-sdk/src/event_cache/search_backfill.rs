@@ -351,6 +351,17 @@ pub struct RoomBackfillRun {
     pub oldest_event_ts: Option<u64>,
 }
 
+/// How long a room stays loaded in the event cache after a per-room backfill
+/// run that left more history to load.
+///
+/// The back-pagination queue subscribes to the room only for the duration of a
+/// run, and the room is auto-shrunk to its last chunk when the last subscriber
+/// goes away. The next run would then restart from the most recent chunk and
+/// spend all its batches re-reading history that is already stored, never
+/// getting past it. Keeping the room loaded between two consecutive runs of the
+/// same indexing avoids that; the room is shrunk once the indexing is idle.
+const KEEP_ROOM_LOADED_BETWEEN_RUNS: Duration = Duration::from_secs(120);
+
 impl EventCache {
     /// Back-paginate a single room for at most `max_batches` batches, at the
     /// given priority and without any age floor.
@@ -381,6 +392,10 @@ impl EventCache {
         let Some(queue) = self.back_pagination_queue() else {
             return failed;
         };
+
+        // Keep the room loaded for this run, and for a while after it if there
+        // is more to load (see `KEEP_ROOM_LOADED_BETWEEN_RUNS`).
+        let keep_loaded = self.subscribe_to_keep_room_loaded(room_id).await;
 
         let loaded = Arc::new(AtomicU32::new(0));
         let oldest = Arc::new(AtomicU64::new(u64::MAX));
@@ -427,6 +442,17 @@ impl EventCache {
             BackPaginationStopReason::Cancelled => RoomBackfillStatus::Cancelled,
         };
 
+        if status == RoomBackfillStatus::MoreToLoad
+            && let Some(keep_loaded) = keep_loaded
+        {
+            // The next run of this indexing will most likely start soon.
+            // Release the room later, from a detached task.
+            matrix_sdk_common::executor::spawn(async move {
+                sleep(KEEP_ROOM_LOADED_BETWEEN_RUNS).await;
+                drop(keep_loaded);
+            });
+        }
+
         let oldest = oldest.load(Ordering::Relaxed);
 
         RoomBackfillRun {
@@ -434,6 +460,20 @@ impl EventCache {
             events_loaded: loaded.load(Ordering::Relaxed),
             oldest_event_ts: (oldest != u64::MAX).then_some(oldest),
         }
+    }
+}
+
+impl EventCache {
+    /// Subscribe to the room, to prevent it from being auto-shrunk for as long
+    /// as the returned value is alive. Returns `None` if the room has no
+    /// caches.
+    async fn subscribe_to_keep_room_loaded(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        let room = self.inner.all_caches_for_room(room_id).await.ok()?.room().clone();
+        let (_events, subscriber) = room.subscribe().await.ok()?;
+        Some(Box::new(subscriber))
     }
 }
 
