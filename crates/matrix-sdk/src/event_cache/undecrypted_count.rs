@@ -15,8 +15,13 @@
 //! Counting the messages of a room that couldn't be decrypted, so they can't
 //! be searched.
 
-use matrix_sdk_base::event_cache::store::extract_event_relation;
+use matrix_sdk_base::{
+    cross_process_lock::MappedCrossProcessLockState, event_cache::store::extract_event_relation,
+};
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
+use ruma::RoomId;
+
+use super::{EventCache, EventCacheError, Result};
 
 /// The relation type of the events that belong to a thread.
 const THREAD_REL_TYPE: &str = "m.thread";
@@ -28,7 +33,6 @@ const THREAD_REL_TYPE: &str = "m.thread";
 /// (`m.annotation`), an edit (`m.replace`) or any other relation but a thread
 /// can be told from a message without decrypting it. A reply has no
 /// `rel_type` at all, so it is a message, and so is an event of a thread.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn is_undecrypted_message(event: &TimelineEvent) -> bool {
     match extract_event_relation(event.raw()) {
         None => true,
@@ -36,19 +40,53 @@ pub(super) fn is_undecrypted_message(event: &TimelineEvent) -> bool {
     }
 }
 
+impl EventCache {
+    /// Count the messages of a room that couldn't be decrypted, so they
+    /// can't be searched.
+    ///
+    /// The reactions, edits and other relations that couldn't be decrypted
+    /// are not counted, as they are not messages. The count comes straight
+    /// from the event cache store, so it doesn't load the room.
+    pub async fn count_undecrypted_messages(&self, room_id: &RoomId) -> Result<u64> {
+        let Some(client) = self.inner.client.get() else {
+            return Err(EventCacheError::ClientDropped);
+        };
+
+        let store = match client.event_cache_store().lock().await? {
+            MappedCrossProcessLockState::Clean(store)
+            | MappedCrossProcessLockState::Dirty(store) => store,
+        };
+
+        let events = store.get_room_events(room_id, Some("m.room.encrypted"), None).await?;
+
+        let count =
+            events.iter().filter(|event| event.kind.is_utd() && is_undecrypted_message(event));
+
+        Ok(count.count() as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use matrix_sdk_base::cross_process_lock::MappedCrossProcessLockState;
     use matrix_sdk_common::deserialized_responses::{
         TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
     };
-    use ruma::{events::AnySyncTimelineEvent, serde::Raw};
+    use matrix_sdk_test::async_test;
+    use ruma::{events::AnySyncTimelineEvent, room_id, serde::Raw};
     use serde_json::{Value, json};
 
     use super::is_undecrypted_message;
+    use crate::test_utils::mocks::MatrixMockServer;
 
     /// An `m.room.encrypted` event that couldn't be decrypted, with an
     /// optional `m.relates_to` in its clear content.
     fn a_utd(relation: Option<Value>) -> TimelineEvent {
+        a_utd_with_id("$event:example.org", relation)
+    }
+
+    /// Same as [`a_utd`], with the given event id.
+    fn a_utd_with_id(event_id: &str, relation: Option<Value>) -> TimelineEvent {
         let mut content = json!({
             "algorithm": "m.megolm.v1.aes-sha2",
             "ciphertext": "",
@@ -62,7 +100,7 @@ mod tests {
 
         let event = json!({
             "type": "m.room.encrypted",
-            "event_id": "$event:example.org",
+            "event_id": event_id,
             "sender": "@alice:example.org",
             "origin_server_ts": 1,
             "content": content,
@@ -124,5 +162,36 @@ mod tests {
         let reference = json!({ "rel_type": "m.reference", "event_id": "$target:example.org" });
 
         assert!(!is_undecrypted_message(&a_utd(Some(reference))));
+    }
+
+    /// Only the messages of the room that couldn't be decrypted are counted,
+    /// not their reactions or edits, nor the events of the other rooms.
+    #[async_test]
+    async fn test_count_undecrypted_messages_of_a_room() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!room:example.org");
+        let other_room_id = room_id!("!other:example.org");
+
+        let reaction = json!({ "rel_type": "m.annotation", "event_id": "$1", "key": "👍" });
+        let edit = json!({ "rel_type": "m.replace", "event_id": "$1" });
+
+        {
+            let store = match client.event_cache_store().lock().await.unwrap() {
+                MappedCrossProcessLockState::Clean(store)
+                | MappedCrossProcessLockState::Dirty(store) => store,
+            };
+            store.save_event(room_id, a_utd_with_id("$1", None)).await.unwrap();
+            store.save_event(room_id, a_utd_with_id("$2", Some(reaction))).await.unwrap();
+            store.save_event(room_id, a_utd_with_id("$3", Some(edit))).await.unwrap();
+            store.save_event(room_id, a_utd_with_id("$4", None)).await.unwrap();
+            store.save_event(other_room_id, a_utd_with_id("$5", None)).await.unwrap();
+        }
+
+        let event_cache = client.event_cache().unwrap();
+
+        assert_eq!(event_cache.count_undecrypted_messages(room_id).await.unwrap(), 2);
+        assert_eq!(event_cache.count_undecrypted_messages(other_room_id).await.unwrap(), 1);
     }
 }
