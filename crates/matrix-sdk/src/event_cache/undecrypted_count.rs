@@ -112,7 +112,6 @@ impl EventCache {
 
 /// A run of consecutive messages of a room that couldn't be decrypted.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct UndecryptedRange {
     /// The oldest message of the range.
     pub first_event_id: OwnedEventId,
@@ -132,7 +131,6 @@ pub struct UndecryptedRange {
 /// The reactions, edits and other relations that couldn't be decrypted
 /// neither break a range nor are counted in it. The ranges are listed from the
 /// oldest to the newest.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn undecrypted_ranges<Gap>(
     chunks: &[RawChunk<TimelineEvent, Gap>],
 ) -> Vec<UndecryptedRange> {
