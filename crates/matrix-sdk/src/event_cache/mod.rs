@@ -68,6 +68,8 @@ mod redecryptor;
 mod search_backfill;
 mod states;
 mod tasks;
+#[cfg(feature = "e2e-encryption")]
+mod undecrypted_count;
 
 #[cfg(feature = "e2e-encryption")]
 pub use redecryptor::{DecryptionRetryRequest, RedecryptorReport};
