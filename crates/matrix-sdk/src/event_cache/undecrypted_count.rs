@@ -72,8 +72,8 @@ mod tests {
     use matrix_sdk_common::deserialized_responses::{
         TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
     };
-    use matrix_sdk_test::async_test;
-    use ruma::{events::AnySyncTimelineEvent, room_id, serde::Raw};
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+    use ruma::{RoomId, event_id, events::AnySyncTimelineEvent, room_id, serde::Raw, user_id};
     use serde_json::{Value, json};
 
     use super::is_undecrypted_message;
@@ -193,5 +193,50 @@ mod tests {
 
         assert_eq!(event_cache.count_undecrypted_messages(room_id).await.unwrap(), 2);
         assert_eq!(event_cache.count_undecrypted_messages(other_room_id).await.unwrap(), 1);
+    }
+
+    /// Save an event in the event cache store of the client.
+    async fn save(client: &crate::Client, room_id: &RoomId, event: TimelineEvent) {
+        let store = match client.event_cache_store().lock().await.unwrap() {
+            MappedCrossProcessLockState::Clean(store)
+            | MappedCrossProcessLockState::Dirty(store) => store,
+        };
+        store.save_event(room_id, event).await.unwrap();
+    }
+
+    /// On a SQLite store, a message that couldn't be decrypted stops being
+    /// counted once its decrypted event replaces it.
+    #[async_test]
+    async fn test_decrypted_message_is_no_longer_counted_on_sqlite() {
+        let server = MatrixMockServer::new().await;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(tmp_dir.path(), None))
+            .build()
+            .await;
+
+        // SQLite did create something in the directory.
+        assert!(std::fs::read_dir(tmp_dir.path()).unwrap().count() > 0);
+
+        let room_id = room_id!("!room:example.org");
+
+        save(&client, room_id, a_utd_with_id("$1", None)).await;
+        save(&client, room_id, a_utd_with_id("$2", None)).await;
+
+        let event_cache = client.event_cache().unwrap();
+        assert_eq!(event_cache.count_undecrypted_messages(room_id).await.unwrap(), 2);
+
+        // The room key arrives: the first event gets decrypted, and replaces
+        // the undecryptable one in the store.
+        let decrypted = EventFactory::new()
+            .room(room_id)
+            .sender(user_id!("@alice:example.org"))
+            .text_msg("hello")
+            .event_id(event_id!("$1"))
+            .into();
+        save(&client, room_id, decrypted).await;
+
+        assert_eq!(event_cache.count_undecrypted_messages(room_id).await.unwrap(), 1);
     }
 }
