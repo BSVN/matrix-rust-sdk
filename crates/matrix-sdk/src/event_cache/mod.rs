@@ -210,6 +210,12 @@ pub struct EventCacheDropHandles {
     #[cfg(feature = "experimental-search")]
     _search_indexing_task: BackgroundTaskHandle,
 
+    /// A background task indexing the events that were decrypted late,
+    /// after their room key arrived, since the redecryptor replaces them
+    /// without sending a linked chunk update.
+    #[cfg(all(feature = "experimental-search", feature = "e2e-encryption"))]
+    _search_utd_indexing_task: BackgroundTaskHandle,
+
     /// The task used to automatically redecrypt UTDs.
     #[cfg(feature = "e2e-encryption")]
     redecryptor: OnceLock<redecryptor::Redecryptor>,
@@ -272,6 +278,18 @@ impl EventCacheDropHandles {
             )
             .abort_on_drop();
 
+        #[cfg(all(feature = "experimental-search", feature = "e2e-encryption"))]
+        let search_utd_indexing_task = client
+            .task_monitor()
+            .spawn_infinite_task(
+                "event_cache::search_utd_indexing",
+                tasks::search_utd_indexing_task(
+                    event_cache_inner.client.clone(),
+                    event_cache_inner.redecryption_channels.utd_reporter.subscribe(),
+                ),
+            )
+            .abort_on_drop();
+
         if event_cache_inner.enable_automatic_back_pagination {
             // Deferred initialization of the shared back-pagination queue.
             trace!("spawning the back-pagination queue");
@@ -298,6 +316,8 @@ impl EventCacheDropHandles {
             _thread_subscriber_task: thread_subscriber_task,
             #[cfg(feature = "experimental-search")]
             _search_indexing_task: search_indexing_task,
+            #[cfg(all(feature = "experimental-search", feature = "e2e-encryption"))]
+            _search_utd_indexing_task: search_utd_indexing_task,
         }
     }
 }
