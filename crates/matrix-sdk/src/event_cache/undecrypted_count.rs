@@ -16,10 +16,12 @@
 //! be searched.
 
 use matrix_sdk_base::{
-    cross_process_lock::MappedCrossProcessLockState, event_cache::store::extract_event_relation,
+    cross_process_lock::MappedCrossProcessLockState,
+    event_cache::store::extract_event_relation,
+    linked_chunk::{ChunkContent, RawChunk},
 };
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
-use ruma::RoomId;
+use ruma::{OwnedEventId, RoomId};
 
 use super::{EventCache, EventCacheError, Result};
 
@@ -34,10 +36,32 @@ const THREAD_REL_TYPE: &str = "m.thread";
 /// can be told from a message without decrypting it. A reply has no
 /// `rel_type` at all, so it is a message, and so is an event of a thread.
 pub(super) fn is_undecrypted_message(event: &TimelineEvent) -> bool {
+    has_message_relation(event)
+}
+
+/// Whether an event is in no relation to another one, or in a thread: that is
+/// what a message looks like, as opposed to a reaction, an edit or any other
+/// relation.
+fn has_message_relation(event: &TimelineEvent) -> bool {
     match extract_event_relation(event.raw()) {
         None => true,
         Some((_, rel_type)) => rel_type == THREAD_REL_TYPE,
     }
+}
+
+/// The types of the events that are messages, when they can be read.
+const READABLE_MESSAGE_TYPES: [&str; 4] =
+    ["m.room.message", "m.sticker", "m.poll.start", "org.matrix.msc3381.poll.start"];
+
+/// Whether an event that could be decrypted, or that was never encrypted, is a
+/// message that can be read. The state events, and the reactions, edits and
+/// other relations are not.
+fn is_readable_message(event: &TimelineEvent) -> bool {
+    event
+        .kind
+        .event_type()
+        .is_some_and(|event_type| READABLE_MESSAGE_TYPES.contains(&event_type.as_str()))
+        && has_message_relation(event)
 }
 
 impl EventCache {
@@ -66,9 +90,83 @@ impl EventCache {
     }
 }
 
+/// A run of consecutive messages of a room that couldn't be decrypted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct UndecryptedRange {
+    /// The oldest message of the range.
+    pub first_event_id: OwnedEventId,
+    /// The newest message of the range.
+    pub last_event_id: OwnedEventId,
+    /// The number of messages in the range.
+    pub message_count: u64,
+}
+
+/// Find the ranges of consecutive messages that couldn't be decrypted in the
+/// chunks of a room.
+///
+/// The chunks come in any order: they are followed from the first one, using
+/// their links. A range is closed by a gap, or by a message that can be read.
+/// The other events that can be read, such as the state events, don't close
+/// it.
+/// The reactions, edits and other relations that couldn't be decrypted
+/// neither break a range nor are counted in it. The ranges are listed from the
+/// oldest to the newest.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn undecrypted_ranges<Gap>(
+    chunks: &[RawChunk<TimelineEvent, Gap>],
+) -> Vec<UndecryptedRange> {
+    let mut ranges = Vec::new();
+    let mut open: Option<UndecryptedRange> = None;
+
+    let mut current = chunks.iter().find(|chunk| chunk.previous.is_none());
+
+    // Bounded by the number of chunks, so a corrupted link can't loop forever.
+    for _ in 0..chunks.len() {
+        let Some(chunk) = current else { break };
+
+        match &chunk.content {
+            ChunkContent::Gap(_) => ranges.extend(open.take()),
+            ChunkContent::Items(events) => {
+                for event in events {
+                    if !event.kind.is_utd() {
+                        if is_readable_message(event) {
+                            ranges.extend(open.take());
+                        }
+                    } else if is_undecrypted_message(event)
+                        && let Some(event_id) = event.event_id()
+                    {
+                        if let Some(range) = open.as_mut() {
+                            range.last_event_id = event_id.to_owned();
+                            range.message_count += 1;
+                        } else {
+                            open = Some(UndecryptedRange {
+                                first_event_id: event_id.to_owned(),
+                                last_event_id: event_id.to_owned(),
+                                message_count: 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        current = chunk
+            .next
+            .as_ref()
+            .and_then(|next| chunks.iter().find(|candidate| &candidate.identifier == next));
+    }
+
+    ranges.extend(open);
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
-    use matrix_sdk_base::cross_process_lock::MappedCrossProcessLockState;
+    use matrix_sdk_base::{
+        cross_process_lock::MappedCrossProcessLockState,
+        linked_chunk::{ChunkContent, ChunkIdentifier, RawChunk},
+    };
     use matrix_sdk_common::deserialized_responses::{
         TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
     };
@@ -76,7 +174,7 @@ mod tests {
     use ruma::{RoomId, event_id, events::AnySyncTimelineEvent, room_id, serde::Raw, user_id};
     use serde_json::{Value, json};
 
-    use super::is_undecrypted_message;
+    use super::{UndecryptedRange, is_undecrypted_message, undecrypted_ranges};
     use crate::test_utils::mocks::MatrixMockServer;
 
     /// An `m.room.encrypted` event that couldn't be decrypted, with an
@@ -238,5 +336,138 @@ mod tests {
         save(&client, room_id, decrypted).await;
 
         assert_eq!(event_cache.count_undecrypted_messages(room_id).await.unwrap(), 1);
+    }
+
+    /// A message that was decrypted, so it can be read.
+    fn a_readable_message(event_id: &str) -> TimelineEvent {
+        EventFactory::new()
+            .room(room_id!("!room:example.org"))
+            .sender(user_id!("@alice:example.org"))
+            .text_msg("hello")
+            .event_id(&ruma::EventId::parse(event_id).unwrap())
+            .into()
+    }
+
+    /// A reaction that couldn't be decrypted.
+    fn an_undecrypted_reaction(event_id: &str) -> TimelineEvent {
+        let reaction = json!({ "rel_type": "m.annotation", "event_id": "$target", "key": "👍" });
+        a_utd_with_id(event_id, Some(reaction))
+    }
+
+    /// A chunk of events, linked to the given chunks.
+    fn items_chunk(
+        id: u64,
+        previous: Option<u64>,
+        next: Option<u64>,
+        events: Vec<TimelineEvent>,
+    ) -> RawChunk<TimelineEvent, ()> {
+        RawChunk {
+            content: ChunkContent::Items(events),
+            previous: previous.map(ChunkIdentifier::new),
+            identifier: ChunkIdentifier::new(id),
+            next: next.map(ChunkIdentifier::new),
+        }
+    }
+
+    /// A gap, linked to the given chunks.
+    fn gap_chunk(id: u64, previous: Option<u64>, next: Option<u64>) -> RawChunk<TimelineEvent, ()> {
+        RawChunk {
+            content: ChunkContent::Gap(()),
+            previous: previous.map(ChunkIdentifier::new),
+            identifier: ChunkIdentifier::new(id),
+            next: next.map(ChunkIdentifier::new),
+        }
+    }
+
+    /// The expected range from the first to the last event id.
+    fn range(first: &str, last: &str, message_count: u64) -> UndecryptedRange {
+        UndecryptedRange {
+            first_event_id: ruma::EventId::parse(first).unwrap(),
+            last_event_id: ruma::EventId::parse(last).unwrap(),
+            message_count,
+        }
+    }
+
+    #[test]
+    fn test_ranges_without_chunks() {
+        assert_eq!(undecrypted_ranges::<()>(&[]), vec![]);
+    }
+
+    #[test]
+    fn test_ranges_of_a_room_without_undecrypted_messages() {
+        let chunks = [items_chunk(1, None, None, vec![a_readable_message("$1")])];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![]);
+    }
+
+    #[test]
+    fn test_ranges_consecutive_undecrypted_messages_make_one_range() {
+        let events =
+            vec![a_utd_with_id("$1", None), a_utd_with_id("$2", None), a_utd_with_id("$3", None)];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$3", 3)]);
+    }
+
+    #[test]
+    fn test_ranges_a_readable_message_splits_a_range() {
+        let events =
+            vec![a_utd_with_id("$1", None), a_readable_message("$2"), a_utd_with_id("$3", None)];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$1", 1), range("$3", "$3", 1)]);
+    }
+
+    #[test]
+    fn test_ranges_a_gap_splits_a_range() {
+        let chunks = [
+            items_chunk(1, None, Some(2), vec![a_utd_with_id("$1", None)]),
+            gap_chunk(2, Some(1), Some(3)),
+            items_chunk(3, Some(2), None, vec![a_utd_with_id("$2", None)]),
+        ];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$1", 1), range("$2", "$2", 1)]);
+    }
+
+    #[test]
+    fn test_ranges_an_undecrypted_reaction_neither_splits_nor_counts() {
+        let events = vec![
+            a_utd_with_id("$1", None),
+            an_undecrypted_reaction("$reaction"),
+            a_utd_with_id("$2", None),
+        ];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$2", 2)]);
+    }
+
+    #[test]
+    fn test_ranges_follow_the_links_between_chunks() {
+        // The chunks are given out of order, and a range goes over two of them.
+        let chunks = [
+            items_chunk(2, Some(1), None, vec![a_utd_with_id("$3", None)]),
+            items_chunk(
+                1,
+                None,
+                Some(2),
+                vec![a_utd_with_id("$1", None), a_utd_with_id("$2", None)],
+            ),
+        ];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$3", 3)]);
+    }
+
+    #[test]
+    fn test_ranges_a_readable_state_event_does_not_split_a_range() {
+        let join: TimelineEvent = EventFactory::new()
+            .room(room_id!("!room:example.org"))
+            .sender(user_id!("@bob:example.org"))
+            .member(user_id!("@bob:example.org"))
+            .event_id(&ruma::EventId::parse("$join").unwrap())
+            .into();
+        let events = vec![a_utd_with_id("$1", None), join, a_utd_with_id("$2", None)];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$2", 2)]);
     }
 }
