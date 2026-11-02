@@ -2489,6 +2489,23 @@ impl Client {
         Ok(event_cache.backfill_room_history(&room_id, priority, max_batches as usize).await)
     }
 
+    /// What is known about the search index of a room: how many of its
+    /// messages a search can find. A room that was never indexed has none.
+    #[cfg(feature = "experimental-search")]
+    pub async fn room_index_stats(&self, room_id: String) -> Result<RoomIndexStats, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        let indexed_count = self
+            .inner
+            .search_index()
+            .lock()
+            .await
+            .indexed_count(&room_id)
+            .map_err(|err| ClientError::from(anyhow::anyhow!("{err}")))?;
+
+        Ok(RoomIndexStats { indexed_count })
+    }
+
     pub fn homeserver_capabilities(&self) -> HomeserverCapabilities {
         HomeserverCapabilities::new(self.inner.homeserver_capabilities())
     }
@@ -2905,6 +2922,13 @@ impl From<NotificationProcessSetup> for MatrixNotificationProcessSetup {
 }
 
 /// Information about a room, that was resolved from a room alias.
+/// What is known about the search index of a room.
+#[derive(uniffi::Record)]
+pub struct RoomIndexStats {
+    /// The number of messages a search can find in the room.
+    pub indexed_count: u64,
+}
+
 #[derive(uniffi::Record)]
 pub struct ResolvedRoomAlias {
     /// The room ID that the alias resolved to.
