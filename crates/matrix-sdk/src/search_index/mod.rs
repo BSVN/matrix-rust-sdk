@@ -291,6 +291,23 @@ impl SearchIndexGuard<'_> {
         index.search(query, max_number_of_results, pagination_offset)
     }
 
+    /// The number of messages indexed for a room, i.e. what a search can find.
+    ///
+    /// A room that was never indexed has none: its count is zero and no index
+    /// is created for it.
+    pub fn indexed_count(&mut self, room_id: &RoomId) -> Result<u64, IndexError> {
+        if !self.has_index(room_id) {
+            return Ok(0);
+        }
+
+        if !self.index_map.contains_key(room_id) {
+            let index = create_index(self.search_index_store_kind, room_id)?;
+            self.index_map.insert(room_id.to_owned(), index);
+        }
+
+        self.index_map.get(room_id).expect("index should exist").indexed_count()
+    }
+
     /// Given a [`TimelineEvent`] this function will derive a
     /// [`RoomIndexOperation`], if it should be handled, and execute it;
     /// returning the result.
@@ -695,6 +712,89 @@ mod tests {
         guard.bulk_execute(Vec::new(), room_id).unwrap();
 
         assert!(!dir.path().join(room_id.as_str()).exists());
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_indexed_count_creates_no_index_for_nothing() {
+        use super::{SearchIndex, SearchIndexStoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let search_index = SearchIndex::new(
+            Default::default(),
+            SearchIndexStoreKind::UnencryptedDirectory(dir.path().to_path_buf()),
+        );
+        let room_id = room_id!("!room_id:localhost");
+        let mut guard = search_index.lock().await;
+
+        assert_eq!(guard.indexed_count(room_id).unwrap(), 0);
+        assert!(!dir.path().join(room_id.as_str()).exists());
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_indexed_count_follows_the_indexed_messages() {
+        use super::{IndexableEvent, RoomIndexOperation, SearchIndex, SearchIndexStoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let search_index = SearchIndex::new(
+            Default::default(),
+            SearchIndexStoreKind::UnencryptedDirectory(dir.path().to_path_buf()),
+        );
+        let room_id = room_id!("!room_id:localhost");
+        let mut guard = search_index.lock().await;
+
+        let operations = vec![
+            RoomIndexOperation::Add(IndexableEvent::new(
+                event_id!("$one:localhost").to_owned(),
+                event_id!("$one:localhost").to_owned(),
+                user_id!("@user_id:localhost").to_owned(),
+                None,
+                "first message".to_owned(),
+            )),
+            RoomIndexOperation::Add(IndexableEvent::new(
+                event_id!("$two:localhost").to_owned(),
+                event_id!("$two:localhost").to_owned(),
+                user_id!("@user_id:localhost").to_owned(),
+                None,
+                "second message".to_owned(),
+            )),
+        ];
+        guard.bulk_execute(operations, room_id).unwrap();
+
+        assert_eq!(guard.indexed_count(room_id).unwrap(), 2);
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_indexed_count_opens_an_index_that_exists_on_disk() {
+        use super::{IndexableEvent, RoomIndexOperation, SearchIndex, SearchIndexStoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let kind = SearchIndexStoreKind::UnencryptedDirectory(dir.path().to_path_buf());
+        let room_id = room_id!("!room_id:localhost");
+
+        {
+            let search_index = SearchIndex::new(Default::default(), kind.clone());
+            search_index
+                .lock()
+                .await
+                .bulk_execute(
+                    vec![RoomIndexOperation::Add(IndexableEvent::new(
+                        event_id!("$one:localhost").to_owned(),
+                        event_id!("$one:localhost").to_owned(),
+                        user_id!("@user_id:localhost").to_owned(),
+                        None,
+                        "first message".to_owned(),
+                    ))],
+                    room_id,
+                )
+                .unwrap();
+        }
+
+        // A new `SearchIndex` has no index open yet: it must find the one on disk.
+        let reopened = SearchIndex::new(Default::default(), kind);
+        assert_eq!(reopened.lock().await.indexed_count(room_id).unwrap(), 1);
     }
 
     #[cfg(feature = "experimental-search")]
