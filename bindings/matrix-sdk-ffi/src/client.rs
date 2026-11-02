@@ -2506,6 +2506,36 @@ impl Client {
         Ok(RoomIndexStats { indexed_count })
     }
 
+    /// What is known about the messages of a room that couldn't be
+    /// decrypted, so a search can't find them: how many they are, and the
+    /// ranges of consecutive ones, from the oldest to the newest.
+    ///
+    /// `message_count` counts the messages of the event cache store of the
+    /// room, and can differ from the sum of the ranges: the events that the
+    /// room cache doesn't hold in its chunks, such as some pinned or thread
+    /// events, are counted but belong to no range.
+    ///
+    /// Requires `ClientBuilder::enable_event_cache`, otherwise it fails.
+    pub async fn room_undecrypted_info(
+        &self,
+        room_id: String,
+    ) -> Result<RoomUndecryptedInfo, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        let event_cache = self
+            .inner
+            .event_cache()
+            .ok_or_else(|| ClientError::from(anyhow::anyhow!("the event cache is not enabled")))?;
+
+        let message_count = event_cache.count_undecrypted_messages(&room_id).await?;
+        let ranges = event_cache.undecrypted_ranges(&room_id).await?;
+
+        Ok(RoomUndecryptedInfo {
+            message_count,
+            ranges: ranges.into_iter().map(Into::into).collect(),
+        })
+    }
+
     pub fn homeserver_capabilities(&self) -> HomeserverCapabilities {
         HomeserverCapabilities::new(self.inner.homeserver_capabilities())
     }
@@ -2927,6 +2957,59 @@ impl From<NotificationProcessSetup> for MatrixNotificationProcessSetup {
 pub struct RoomIndexStats {
     /// The number of messages a search can find in the room.
     pub indexed_count: u64,
+}
+
+/// What is known about the messages of a room that couldn't be decrypted.
+#[derive(uniffi::Record)]
+pub struct RoomUndecryptedInfo {
+    /// The number of messages that couldn't be decrypted.
+    pub message_count: u64,
+    /// The ranges of consecutive messages that couldn't be decrypted, from
+    /// the oldest to the newest.
+    pub ranges: Vec<UndecryptedRangeInfo>,
+}
+
+/// A run of consecutive messages of a room that couldn't be decrypted.
+#[derive(uniffi::Record)]
+pub struct UndecryptedRangeInfo {
+    /// The event id of the oldest message of the range.
+    pub first_event_id: String,
+    /// The event id of the newest message of the range.
+    pub last_event_id: String,
+    /// The number of messages in the range.
+    pub message_count: u64,
+}
+
+impl From<matrix_sdk::event_cache::UndecryptedRange> for UndecryptedRangeInfo {
+    fn from(range: matrix_sdk::event_cache::UndecryptedRange) -> Self {
+        Self {
+            first_event_id: range.first_event_id.to_string(),
+            last_event_id: range.last_event_id.to_string(),
+            message_count: range.message_count,
+        }
+    }
+}
+
+#[cfg(test)]
+mod undecrypted_range_info_tests {
+    use matrix_sdk::{event_cache::UndecryptedRange, ruma::event_id};
+
+    use super::UndecryptedRangeInfo;
+
+    #[test]
+    fn test_range_is_converted_for_the_bindings() {
+        let range = UndecryptedRange {
+            first_event_id: event_id!("$1:example.org").to_owned(),
+            last_event_id: event_id!("$2:example.org").to_owned(),
+            message_count: 7,
+        };
+
+        let info = UndecryptedRangeInfo::from(range);
+
+        assert_eq!(info.first_event_id, "$1:example.org");
+        assert_eq!(info.last_event_id, "$2:example.org");
+        assert_eq!(info.message_count, 7);
+    }
 }
 
 #[derive(uniffi::Record)]
