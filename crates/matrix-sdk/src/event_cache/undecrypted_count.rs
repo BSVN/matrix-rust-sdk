@@ -502,4 +502,70 @@ mod tests {
 
         assert_eq!(ranges, vec![]);
     }
+
+    /// The ranges are built from chunks written in a real SQLite store: a
+    /// readable message and a gap both split a range.
+    #[async_test]
+    async fn test_ranges_of_chunks_written_in_a_sqlite_store() {
+        use matrix_sdk_base::event_cache::Gap;
+        use matrix_sdk_common::linked_chunk::{
+            ChunkIdentifier as CId, LinkedChunkId, Position, Update,
+        };
+
+        let server = MatrixMockServer::new().await;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(tmp_dir.path(), None))
+            .build()
+            .await;
+
+        let room_id = room_id!("!room:example.org");
+
+        {
+            let store = match client.event_cache_store().lock().await.unwrap() {
+                MappedCrossProcessLockState::Clean(store)
+                | MappedCrossProcessLockState::Dirty(store) => store,
+            };
+
+            store
+                .handle_linked_chunk_updates(
+                    LinkedChunkId::Room(room_id),
+                    vec![
+                        Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                        Update::PushItems {
+                            at: Position::new(CId::new(0), 0),
+                            items: vec![
+                                a_utd_with_id("$1", None),
+                                a_utd_with_id("$2", None),
+                                a_readable_message("$3"),
+                                a_utd_with_id("$4", None),
+                            ],
+                        },
+                        Update::NewGapChunk {
+                            previous: Some(CId::new(0)),
+                            new: CId::new(1),
+                            next: None,
+                            gap: Gap { token: "gap".to_owned() },
+                        },
+                        Update::NewItemsChunk {
+                            previous: Some(CId::new(1)),
+                            new: CId::new(2),
+                            next: None,
+                        },
+                        Update::PushItems {
+                            at: Position::new(CId::new(2), 0),
+                            items: vec![a_utd_with_id("$5", None), a_utd_with_id("$6", None)],
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let event_cache = client.event_cache().unwrap();
+        let ranges = event_cache.undecrypted_ranges(room_id).await.unwrap();
+
+        assert_eq!(ranges, vec![range("$1", "$2", 2), range("$4", "$4", 1), range("$5", "$6", 2)]);
+    }
 }
