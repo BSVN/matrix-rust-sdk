@@ -18,7 +18,7 @@
 use matrix_sdk_base::{
     cross_process_lock::MappedCrossProcessLockState,
     event_cache::store::extract_event_relation,
-    linked_chunk::{ChunkContent, RawChunk},
+    linked_chunk::{ChunkContent, LinkedChunkId, RawChunk},
 };
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
 use ruma::{OwnedEventId, RoomId};
@@ -87,6 +87,26 @@ impl EventCache {
             events.iter().filter(|event| event.kind.is_utd() && is_undecrypted_message(event));
 
         Ok(count.count() as u64)
+    }
+
+    /// Find the ranges of consecutive messages of a room that could not be
+    /// decrypted, from the oldest to the newest.
+    ///
+    /// The ranges come straight from the chunks of the event cache store, so
+    /// they do not load the room.
+    pub async fn undecrypted_ranges(&self, room_id: &RoomId) -> Result<Vec<UndecryptedRange>> {
+        let Some(client) = self.inner.client.get() else {
+            return Err(EventCacheError::ClientDropped);
+        };
+
+        let store = match client.event_cache_store().lock().await? {
+            MappedCrossProcessLockState::Clean(store)
+            | MappedCrossProcessLockState::Dirty(store) => store,
+        };
+
+        let chunks = store.load_all_chunks(LinkedChunkId::Room(room_id)).await?;
+
+        Ok(undecrypted_ranges(&chunks))
     }
 }
 
@@ -469,5 +489,17 @@ mod tests {
         let chunks = [items_chunk(1, None, None, events)];
 
         assert_eq!(undecrypted_ranges(&chunks), vec![range("$1", "$2", 2)]);
+    }
+
+    /// A room that has no chunk in the store has no range.
+    #[async_test]
+    async fn test_ranges_of_a_room_without_chunks_in_the_store() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let event_cache = client.event_cache().unwrap();
+
+        let ranges = event_cache.undecrypted_ranges(room_id!("!room:example.org")).await.unwrap();
+
+        assert_eq!(ranges, vec![]);
     }
 }
