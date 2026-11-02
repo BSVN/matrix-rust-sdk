@@ -219,6 +219,15 @@ impl RoomIndex {
         self.reader().map(|_| ())
     }
 
+    /// The number of documents of this index, i.e. the messages a search can find.
+    ///
+    /// Every document is committed once [`RoomIndex::execute`] or
+    /// [`RoomIndex::bulk_execute`] returns, so this is up to date after them.
+    /// An edited message is a single document.
+    pub fn indexed_count(&self) -> Result<u64, IndexError> {
+        Ok(self.reader()?.searcher().num_docs())
+    }
+
     /// Commit added events to [`RoomIndex`]. The changes are not reflected in
     /// the search results until the serchers are reloaded.
     ///
@@ -578,6 +587,77 @@ mod tests {
             .into_any_sync_message_like_event();
 
         index_message(&mut index, event).expect("failed to add event");
+    }
+
+    fn a_message(id: &EventId, body: &str) -> AnySyncMessageLikeEvent {
+        EventFactory::new()
+            .text_msg(body)
+            .event_id(id)
+            .room(room_id!("!room_id:localhost"))
+            .sender(user_id!("@user_id:localhost"))
+            .into_any_sync_message_like_event()
+    }
+
+    #[test]
+    fn test_indexed_count_is_zero_for_an_empty_index() {
+        let index = RoomIndexBuilder::new_in_memory(room_id!("!room_id:localhost")).build();
+
+        assert_eq!(index.indexed_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_indexed_count_follows_additions_and_removals() {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!room_id:localhost")).build();
+        let first = event_id!("$first:localhost");
+        let second = event_id!("$second:localhost");
+
+        index_message(&mut index, a_message(first, "first message")).unwrap();
+        index_message(&mut index, a_message(second, "second message")).unwrap();
+        assert_eq!(index.indexed_count().unwrap(), 2);
+
+        index_remove(&mut index, first).unwrap();
+        assert_eq!(index.indexed_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_indexed_count_does_not_grow_when_a_message_is_edited() {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!room_id:localhost")).build();
+        let original = event_id!("$original:localhost");
+        index_message(&mut index, a_message(original, "original text")).unwrap();
+
+        index
+            .execute(RoomIndexOperation::Edit(
+                original.to_owned(),
+                IndexableEvent::new(
+                    event_id!("$edit:localhost").to_owned(),
+                    original.to_owned(),
+                    user_id!("@user_id:localhost").to_owned(),
+                    None,
+                    "edited text".to_owned(),
+                ),
+            ))
+            .unwrap();
+
+        assert_eq!(index.indexed_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_indexed_count_survives_reopening_an_index_on_disk() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let room_id = room_id!("!room_id:localhost");
+
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .unencrypted()
+            .build()
+            .unwrap();
+        index_message(&mut index, a_message(event_id!("$one:localhost"), "one")).unwrap();
+        drop(index);
+
+        let reopened = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .unencrypted()
+            .build()
+            .unwrap();
+        assert_eq!(reopened.indexed_count().unwrap(), 1);
     }
 
     #[test]
