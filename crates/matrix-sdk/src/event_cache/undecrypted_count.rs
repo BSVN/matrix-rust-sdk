@@ -566,4 +566,78 @@ mod tests {
 
         assert_eq!(ranges, vec![range("$1", "$2", 2), range("$4", "$4", 1), range("$5", "$6", 2)]);
     }
+
+    /// Measures the cost of reading a big room from a SQLite store. It is
+    /// slow, so it only runs when asked: `-- --ignored --nocapture`.
+    #[async_test]
+    #[ignore = "measures the cost on a big synthetic room, run it by hand"]
+    async fn test_cost_of_the_ranges_of_a_big_synthetic_room() {
+        use std::time::Instant;
+
+        use matrix_sdk_common::linked_chunk::{
+            ChunkIdentifier as CId, LinkedChunkId, Position, Update,
+        };
+
+        const CHUNKS: u64 = 1000;
+        const PER_CHUNK: u64 = 50;
+
+        let server = MatrixMockServer::new().await;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(tmp_dir.path(), None))
+            .build()
+            .await;
+
+        let room_id = room_id!("!room:example.org");
+
+        // One event out of ten can't be decrypted, the others can be read.
+        let mut updates = Vec::new();
+        for chunk in 0..CHUNKS {
+            updates.push(Update::NewItemsChunk {
+                previous: chunk.checked_sub(1).map(CId::new),
+                new: CId::new(chunk),
+                next: None,
+            });
+
+            let items = (0..PER_CHUNK)
+                .map(|i| {
+                    let n = chunk * PER_CHUNK + i;
+                    let event_id = format!("${n}");
+                    if n % 10 == 0 {
+                        a_utd_with_id(&event_id, None)
+                    } else {
+                        a_readable_message(&event_id)
+                    }
+                })
+                .collect();
+
+            updates.push(Update::PushItems { at: Position::new(CId::new(chunk), 0), items });
+        }
+
+        let started = Instant::now();
+        {
+            let store = match client.event_cache_store().lock().await.unwrap() {
+                MappedCrossProcessLockState::Clean(store)
+                | MappedCrossProcessLockState::Dirty(store) => store,
+            };
+
+            store.handle_linked_chunk_updates(LinkedChunkId::Room(room_id), updates).await.unwrap();
+        }
+        println!("write of {} events: {:?}", CHUNKS * PER_CHUNK, started.elapsed());
+
+        let event_cache = client.event_cache().unwrap();
+
+        let started = Instant::now();
+        let count = event_cache.count_undecrypted_messages(room_id).await.unwrap();
+        println!("count_undecrypted_messages: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        let ranges = event_cache.undecrypted_ranges(room_id).await.unwrap();
+        println!("undecrypted_ranges: {:?}", started.elapsed());
+
+        assert_eq!(count, CHUNKS * PER_CHUNK / 10);
+        assert_eq!(ranges.len() as u64, CHUNKS * PER_CHUNK / 10);
+        assert!(ranges.iter().all(|range| range.message_count == 1));
+    }
 }
