@@ -73,6 +73,8 @@ mod undecrypted_count;
 
 #[cfg(feature = "e2e-encryption")]
 pub use redecryptor::{DecryptionRetryRequest, RedecryptorReport};
+#[cfg(feature = "e2e-encryption")]
+pub use undecrypted_count::UndecryptedRange;
 
 pub(crate) use self::caches::room::RFindMapOutcome;
 pub use self::{
