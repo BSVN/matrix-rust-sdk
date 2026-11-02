@@ -526,3 +526,87 @@ async fn index_linked_chunk_updates(
         }
     }
 }
+
+/// Index the events that were decrypted late, once their room key arrived.
+///
+/// The redecryptor replaces such events straight in the store without sending
+/// a linked chunk update, so [`search_indexing_task`] never sees them: they
+/// were skipped as UTDs when they first arrived. Indexing an event twice is
+/// harmless, as adding an already indexed event is a no-op.
+#[cfg(all(feature = "experimental-search", feature = "e2e-encryption"))]
+#[instrument(skip_all)]
+pub(super) async fn search_utd_indexing_task(
+    client: WeakClient,
+    mut report_receiver: tokio::sync::broadcast::Receiver<super::redecryptor::RedecryptorReport>,
+) {
+    use super::redecryptor::RedecryptorReport;
+
+    loop {
+        match report_receiver.recv().await {
+            Ok(RedecryptorReport::ResolvedUtds { room_id, events }) => {
+                index_resolved_utds(&client, &room_id, events).await;
+            }
+            Ok(RedecryptorReport::Lagging | RedecryptorReport::BackupAvailable) => {
+                trace!("Nothing to index for this redecryptor report");
+            }
+            Err(RecvError::Closed) => {
+                debug!("Redecryptor report channel has been closed, exiting UTD indexing task");
+                break;
+            }
+            Err(RecvError::Lagged(num_skipped)) => {
+                warn!(num_skipped, "Lagged behind redecryptor reports");
+            }
+        }
+    }
+}
+
+/// Index the given events of a room, which were just decrypted.
+#[cfg(all(feature = "experimental-search", feature = "e2e-encryption"))]
+async fn index_resolved_utds(
+    client: &WeakClient,
+    room_id: &RoomId,
+    event_ids: std::collections::BTreeSet<OwnedEventId>,
+) {
+    let Some(client) = client.get() else {
+        trace!("Client is shutting down, not indexing decrypted events");
+        return;
+    };
+
+    let Some(event_cache) = client.event_cache() else {
+        error!("EventCache must be enabled since this task runs");
+        return;
+    };
+
+    let Ok((room_cache, _drop_handles)) = event_cache.room(room_id).await else {
+        warn!(for_room = %room_id, "Failed to get RoomEventCache to index decrypted events");
+        return;
+    };
+
+    let Some(room) = client.get_room(room_id) else {
+        warn!(get_room = %room_id, "Failed to get room to index decrypted events");
+        return;
+    };
+
+    let redaction_rules = room.clone_info().room_version_rules_or_default().redaction;
+
+    let mut events = Vec::with_capacity(event_ids.len());
+    for event_id in &event_ids {
+        match room_cache.find_event(event_id).await {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => trace!(%event_id, "Decrypted event not found in the cache"),
+            Err(err) => warn!(%event_id, "Failed to load a decrypted event: {err}"),
+        }
+    }
+
+    if events.is_empty() {
+        return;
+    }
+
+    if let Err(err) = client
+        .search_index()
+        .bulk_handle_timeline_event(events.into_iter(), &room_cache, room_id, &redaction_rules)
+        .await
+    {
+        error!("Failed to index decrypted events: {err}");
+    }
+}

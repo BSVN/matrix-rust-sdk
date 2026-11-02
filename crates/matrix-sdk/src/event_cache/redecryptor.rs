@@ -315,7 +315,7 @@ pub enum RedecryptorReport {
 }
 
 pub(super) struct RedecryptorChannels {
-    utd_reporter: Sender<RedecryptorReport>,
+    pub(super) utd_reporter: Sender<RedecryptorReport>,
     pub(super) decryption_request_sender: UnboundedSender<DecryptionRetryRequest>,
     pub(super) decryption_request_receiver:
         Mutex<Option<UnboundedReceiver<DecryptionRetryRequest>>>,
@@ -1328,6 +1328,19 @@ mod tests {
         alice_enables_cross_signing: bool,
         use_delayed_store: bool,
     ) -> (Client, Client, MatrixMockServer, Option<ControlledMemoryStore>) {
+        set_up_clients_inner(room_id, alice_enables_cross_signing, use_delayed_store, None)
+            .await
+    }
+
+    /// Same as [`set_up_clients`], with an optional on-disk search index for
+    /// Bob.
+    #[cfg_attr(not(feature = "experimental-search"), allow(unused_variables))]
+    async fn set_up_clients_inner(
+        room_id: &RoomId,
+        alice_enables_cross_signing: bool,
+        use_delayed_store: bool,
+        search_index_dir: Option<&std::path::Path>,
+    ) -> (Client, Client, MatrixMockServer, Option<ControlledMemoryStore>) {
         let alice_span = tracing::info_span!("alice");
         let bob_span = tracing::info_span!("bob");
 
@@ -1383,10 +1396,22 @@ mod tests {
         let bob = matrix_mock_server
             .client_builder_for_crypto_end_to_end(bob_user_id, bob_device_id)
             .on_builder(|builder| {
-                builder
+                let builder = builder
                     .with_enable_share_history_on_invite(true)
                     .with_encryption_settings(encryption_settings)
-                    .store_config(store_config)
+                    .store_config(store_config);
+
+                #[cfg(feature = "experimental-search")]
+                let builder = match search_index_dir {
+                    Some(dir) => builder.search_index_store(
+                        crate::search_index::SearchIndexStoreKind::UnencryptedDirectory(
+                            dir.to_path_buf(),
+                        ),
+                    ),
+                    None => builder,
+                };
+
+                builder
             })
             .build()
             .instrument(bob_span.clone())
@@ -1909,6 +1934,60 @@ mod tests {
             .await;
         // Allow the redecryptor some time to retry any UTDs.
         sleep(Duration::from_millis(200)).await;
+    }
+
+    /// An event that was a UTD when it arrived, and got decrypted later once
+    /// its room key arrived, gets indexed.
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_late_decrypted_event_is_indexed() {
+        use futures_util::TryStreamExt as _;
+
+        let room_id = room_id!("!test:localhost");
+        let index_dir = tempfile::tempdir().unwrap();
+
+        let (alice, bob, matrix_mock_server, _) =
+            set_up_clients_inner(room_id, true, false, Some(index_dir.path())).await;
+
+        let (event, room_key) = send_encrypted(
+            &matrix_mock_server,
+            &alice,
+            room_id,
+            event_id!("$some_id"),
+            RoomMessageEventContent::text_plain("It's a secret to everybody"),
+        )
+        .await;
+
+        let event_cache = bob.event_cache().unwrap();
+        let (_room_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
+
+        let count_results = async |query: &str| -> usize {
+            let results: Vec<_> =
+                bob.search_messages(query.to_owned()).build().try_concat().await.unwrap();
+            results.len()
+        };
+
+        // The event reaches Bob as a UTD: it can't be indexed yet.
+        sync_room(
+            &matrix_mock_server,
+            &bob,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(event),
+        )
+        .await;
+        assert_eq!(count_results("secret").await, 0);
+
+        // Once the room key arrives, the event is decrypted, then indexed.
+        sync_room_keys(&matrix_mock_server, &bob, &[room_key]).await;
+
+        let mut found = 0;
+        for _ in 0..50 {
+            found = count_results("secret").await;
+            if found == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(found, 1);
     }
 
     /// Get the cached timeline event kind for a given event ID in a room, if it
