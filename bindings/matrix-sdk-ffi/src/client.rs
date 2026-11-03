@@ -2978,6 +2978,12 @@ pub struct UndecryptedRangeInfo {
     pub last_event_id: String,
     /// The number of messages in the range.
     pub message_count: u64,
+    /// The timestamp of the oldest message of the range, in milliseconds
+    /// since the Unix epoch, if known.
+    pub first_event_timestamp: Option<u64>,
+    /// The timestamp of the newest message of the range, in milliseconds
+    /// since the Unix epoch, if known.
+    pub last_event_timestamp: Option<u64>,
 }
 
 impl From<matrix_sdk::event_cache::UndecryptedRange> for UndecryptedRangeInfo {
@@ -2986,6 +2992,8 @@ impl From<matrix_sdk::event_cache::UndecryptedRange> for UndecryptedRangeInfo {
             first_event_id: range.first_event_id.to_string(),
             last_event_id: range.last_event_id.to_string(),
             message_count: range.message_count,
+            first_event_timestamp: range.first_event_timestamp,
+            last_event_timestamp: range.last_event_timestamp,
         }
     }
 }
@@ -3002,6 +3010,8 @@ mod undecrypted_range_info_tests {
             first_event_id: event_id!("$1:example.org").to_owned(),
             last_event_id: event_id!("$2:example.org").to_owned(),
             message_count: 7,
+            first_event_timestamp: Some(1_000),
+            last_event_timestamp: Some(2_000),
         };
 
         let info = UndecryptedRangeInfo::from(range);
@@ -3009,6 +3019,24 @@ mod undecrypted_range_info_tests {
         assert_eq!(info.first_event_id, "$1:example.org");
         assert_eq!(info.last_event_id, "$2:example.org");
         assert_eq!(info.message_count, 7);
+        assert_eq!(info.first_event_timestamp, Some(1_000));
+        assert_eq!(info.last_event_timestamp, Some(2_000));
+    }
+
+    #[test]
+    fn test_unknown_timestamps_stay_unknown_for_the_bindings() {
+        let range = UndecryptedRange {
+            first_event_id: event_id!("$1:example.org").to_owned(),
+            last_event_id: event_id!("$1:example.org").to_owned(),
+            message_count: 1,
+            first_event_timestamp: None,
+            last_event_timestamp: None,
+        };
+
+        let info = UndecryptedRangeInfo::from(range);
+
+        assert_eq!(info.first_event_timestamp, None);
+        assert_eq!(info.last_event_timestamp, None);
     }
 }
 
