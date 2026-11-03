@@ -119,6 +119,12 @@ pub struct UndecryptedRange {
     pub last_event_id: OwnedEventId,
     /// The number of messages in the range.
     pub message_count: u64,
+    /// The timestamp of the oldest message of the range, in milliseconds
+    /// since the Unix epoch. `None` if the event cache doesn't hold it.
+    pub first_event_timestamp: Option<u64>,
+    /// The timestamp of the newest message of the range, in milliseconds
+    /// since the Unix epoch. `None` if the event cache doesn't hold it.
+    pub last_event_timestamp: Option<u64>,
 }
 
 /// Find the ranges of consecutive messages that couldn't be decrypted in the
@@ -157,11 +163,17 @@ pub(super) fn undecrypted_ranges<Gap>(
                         if let Some(range) = open.as_mut() {
                             range.last_event_id = event_id.to_owned();
                             range.message_count += 1;
+                            if let Some(timestamp) = timestamp_millis(event) {
+                                range.last_event_timestamp = Some(timestamp);
+                            }
                         } else {
+                            let timestamp = timestamp_millis(event);
                             open = Some(UndecryptedRange {
                                 first_event_id: event_id.to_owned(),
                                 last_event_id: event_id.to_owned(),
                                 message_count: 1,
+                                first_event_timestamp: timestamp,
+                                last_event_timestamp: timestamp,
                             });
                         }
                     }
@@ -177,6 +189,15 @@ pub(super) fn undecrypted_ranges<Gap>(
 
     ranges.extend(open);
     ranges
+}
+
+/// The timestamp of an event, in milliseconds since the Unix epoch.
+///
+/// Unlike `TimelineEvent::timestamp`, it doesn't parse the raw event when the
+/// timestamp is missing, so a room with many old events doesn't log a warning
+/// for each of them.
+fn timestamp_millis(event: &TimelineEvent) -> Option<u64> {
+    event.timestamp_raw().map(|timestamp| u64::from(timestamp.get()))
 }
 
 #[cfg(test)]
@@ -203,6 +224,11 @@ mod tests {
 
     /// Same as [`a_utd`], with the given event id.
     fn a_utd_with_id(event_id: &str, relation: Option<Value>) -> TimelineEvent {
+        a_utd_with_id_at(event_id, 1, relation)
+    }
+
+    /// Same as [`a_utd_with_id`], with the given `origin_server_ts`.
+    fn a_utd_with_id_at(event_id: &str, timestamp: u64, relation: Option<Value>) -> TimelineEvent {
         let mut content = json!({
             "algorithm": "m.megolm.v1.aes-sha2",
             "ciphertext": "",
@@ -218,7 +244,7 @@ mod tests {
             "type": "m.room.encrypted",
             "event_id": event_id,
             "sender": "@alice:example.org",
-            "origin_server_ts": 1,
+            "origin_server_ts": timestamp,
             "content": content,
         });
         let raw: Raw<AnySyncTimelineEvent> = serde_json::from_str(&event.to_string()).unwrap();
@@ -403,6 +429,9 @@ mod tests {
             first_event_id: ruma::EventId::parse(first).unwrap(),
             last_event_id: ruma::EventId::parse(last).unwrap(),
             message_count,
+            // The events of the helpers have `origin_server_ts: 1`.
+            first_event_timestamp: Some(1),
+            last_event_timestamp: Some(1),
         }
     }
 
@@ -416,6 +445,54 @@ mod tests {
         let chunks = [items_chunk(1, None, None, vec![a_readable_message("$1")])];
 
         assert_eq!(undecrypted_ranges(&chunks), vec![]);
+    }
+
+    #[test]
+    fn test_ranges_have_the_timestamps_of_their_first_and_last_message() {
+        let events = vec![
+            a_utd_with_id_at("$1", 1_000, None),
+            a_utd_with_id_at("$2", 2_000, None),
+            a_utd_with_id_at("$3", 3_000, None),
+        ];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        let ranges = undecrypted_ranges(&chunks);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].first_event_timestamp, Some(1_000));
+        assert_eq!(ranges[0].last_event_timestamp, Some(3_000));
+    }
+
+    #[test]
+    fn test_ranges_of_a_single_message_have_the_same_timestamps() {
+        let events = vec![a_utd_with_id_at("$1", 5_000, None)];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        let ranges = undecrypted_ranges(&chunks);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].first_event_timestamp, Some(5_000));
+        assert_eq!(ranges[0].last_event_timestamp, Some(5_000));
+    }
+
+    #[test]
+    fn test_each_range_has_its_own_timestamps() {
+        let events = vec![
+            a_utd_with_id_at("$1", 1_000, None),
+            a_utd_with_id_at("$2", 2_000, None),
+            a_readable_message("$3"),
+            a_utd_with_id_at("$4", 4_000, None),
+            a_utd_with_id_at("$5", 5_000, None),
+        ];
+        let chunks = [items_chunk(1, None, None, events)];
+
+        let ranges = undecrypted_ranges(&chunks);
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].first_event_timestamp, Some(1_000));
+        assert_eq!(ranges[0].last_event_timestamp, Some(2_000));
+        assert_eq!(ranges[1].first_event_timestamp, Some(4_000));
+        assert_eq!(ranges[1].last_event_timestamp, Some(5_000));
     }
 
     #[test]
