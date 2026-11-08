@@ -1471,6 +1471,12 @@ impl Client {
         Ok(device_id.to_string())
     }
 
+    /// Fetch the list of devices (sessions) of the current account from the homeserver.
+    pub async fn devices(&self) -> Result<Vec<crate::device_info::DeviceInfo>, ClientError> {
+        let response = self.inner.devices().await?;
+        Ok(response.devices.into_iter().map(Into::into).collect())
+    }
+
     pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
         let response = self.inner.create_room(request.try_into()?).await?;
         Ok(String::from(response.room_id()))
