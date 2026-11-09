@@ -73,9 +73,11 @@ use ruma::events::{
     AnySyncTimelineEvent, SyncMessageLikeEvent, room::encrypted::OriginalSyncRoomEncryptedEvent,
 };
 use ruma::{
-    EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
-    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
+    EventId, Int, MatrixToUri, MatrixUri, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId,
+    OwnedRoomId, OwnedServerName, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt,
+    UserId,
     api::{
+        Direction,
         client::{
             config::{set_global_account_data, set_room_account_data},
             context,
@@ -93,7 +95,7 @@ use ruma::{
             receipt::create_receipt,
             redact::redact_event,
             retention::get_retention_configuration,
-            room::{get_room_event, report_content, report_room},
+            room::{get_event_by_timestamp, get_room_event, report_content, report_room},
             state::{get_state_event_for_key, send_state_event},
             tag::{create_tag, delete_tag},
             threads::{get_thread_subscription, subscribe_thread, unsubscribe_thread},
@@ -849,6 +851,36 @@ impl Room {
         }
 
         event
+    }
+
+    /// Get the ID of the event closest to the given timestamp, using the
+    /// `timestamp_to_event` endpoint of the homeserver.
+    ///
+    /// With [`Direction::Forward`], it is the earliest event at or after
+    /// `timestamp`: the first event of a day when `timestamp` is the start of
+    /// that day. With [`Direction::Backward`], it is the latest event at or
+    /// before `timestamp`.
+    ///
+    /// The event is not loaded, only its ID and its timestamp are returned.
+    /// The homeserver may not support this endpoint.
+    ///
+    /// When running the request against the homeserver, it uses the given
+    /// [`RequestConfig`] if provided, or the client's default one otherwise.
+    pub async fn event_id_for_timestamp(
+        &self,
+        timestamp: MilliSecondsSinceUnixEpoch,
+        direction: Direction,
+        request_config: Option<RequestConfig>,
+    ) -> Result<(OwnedEventId, MilliSecondsSinceUnixEpoch)> {
+        let request = get_event_by_timestamp::v1::Request::new(
+            self.room_id().to_owned(),
+            timestamp,
+            direction,
+        );
+
+        let response = self.client.send(request).with_request_config(request_config).await?;
+
+        Ok((response.event_id, response.origin_server_ts))
     }
 
     /// Fetch the event with the given `EventId` in this room.
@@ -5030,16 +5062,18 @@ mod tests {
         JoinedRoomBuilder, SyncResponseBuilder, TestRoom, async_test, event_factory::EventFactory,
     };
     use ruma::{
-        RoomVersionId, event_id,
+        MilliSecondsSinceUnixEpoch, RoomVersionId,
+        api::Direction,
+        event_id,
         events::{
             relation::RelationType,
             room::{member::MembershipState, retention::RoomRetentionEventContent},
         },
-        owned_event_id, room_id, user_id,
+        owned_event_id, room_id, uint, user_id,
     };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path, path_regex},
+        matchers::{header, method, path, path_regex, query_param},
     };
 
     use crate::{
@@ -5927,4 +5961,61 @@ mod tests {
             .await
             .unwrap_err();
     }
+
+        #[async_test]
+        async fn test_event_id_for_timestamp() {
+            let server = MatrixMockServer::new().await;
+            let client = server.client_builder().build().await;
+            let room = server.sync_joined_room(&client, room_id!("!a:b.c")).await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v1|unstable/org\.matrix\.msc3030)/rooms/.*/timestamp_to_event$",
+                ))
+                .and(query_param("ts", "1000"))
+                .and(query_param("dir", "f"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$first:b.c",
+                    "origin_server_ts": 1500,
+                })))
+                .expect(1)
+                .mount(server.server())
+                .await;
+
+            let (event_id, timestamp) = room
+                .event_id_for_timestamp(
+                    MilliSecondsSinceUnixEpoch(uint!(1000)),
+                    Direction::Forward,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(event_id, event_id!("$first:b.c"));
+            assert_eq!(timestamp, MilliSecondsSinceUnixEpoch(uint!(1500)));
+        }
+
+        #[async_test]
+        async fn test_event_id_for_timestamp_when_the_homeserver_does_not_support_it() {
+            let server = MatrixMockServer::new().await;
+            let client = server.client_builder().build().await;
+            let room = server.sync_joined_room(&client, room_id!("!a:b.c")).await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"/timestamp_to_event$"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_UNRECOGNIZED",
+                    "error": "Unrecognized request",
+                })))
+                .mount(server.server())
+                .await;
+
+            room.event_id_for_timestamp(
+                MilliSecondsSinceUnixEpoch(uint!(1000)),
+                Direction::Forward,
+                None,
+            )
+            .await
+            .unwrap_err();
+        }
 }
