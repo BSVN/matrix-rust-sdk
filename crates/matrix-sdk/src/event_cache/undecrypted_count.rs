@@ -681,7 +681,7 @@ mod tests {
                 .map(|i| {
                     let n = chunk * PER_CHUNK + i;
                     let event_id = format!("${n}");
-                    if n % 10 == 0 {
+                    if n.is_multiple_of(10) {
                         a_utd_with_id(&event_id, None)
                     } else {
                         a_readable_message(&event_id)
