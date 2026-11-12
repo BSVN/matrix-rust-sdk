@@ -33,7 +33,10 @@ use futures_util::{Stream, StreamExt as _};
 use matrix_sdk::{
     Client, deserialized_responses::TimelineEvent, message_search::SearchError, room::Room,
 };
-use ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId};
+use ruma::{
+    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId,
+    events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, room::message::Relation},
+};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::timeline::{Profile, TimelineDetails, TimelineItemContent};
@@ -80,12 +83,33 @@ pub struct MessageResult {
     pub timestamp: MilliSecondsSinceUnixEpoch,
 }
 
+/// The id of the message that `event` edits, or `None` when `event` is not an
+/// edit of a room message.
+///
+/// The index keeps an edit as a document of its own, so a search hit can be the
+/// edit event, for which the timeline has no item: it only has the item of the
+/// original message.
+fn edited_event_id(event: &TimelineEvent) -> Option<OwnedEventId> {
+    let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message))) =
+        event.raw().deserialize()
+    else {
+        return None;
+    };
+
+    match &message.as_original()?.content.relates_to {
+        Some(Relation::Replacement(replacement)) => Some(replacement.event_id.clone()),
+        _ => None,
+    }
+}
+
 impl MessageResult {
     /// Resolve a search hit into a full result by loading its content and
     /// sender profile, returning `None` if the event can't be rendered.
     async fn from_event(room: &Room, event: TimelineEvent) -> Option<Self> {
         let sender = event.sender()?;
-        let event_id = event.event_id()?.to_owned();
+        let own_event_id = event.event_id()?.to_owned();
+        // A hit that is an edit is reported under the message it edits.
+        let event_id = edited_event_id(&event).unwrap_or(own_event_id);
         let timestamp = event.timestamp().unwrap_or_else(MilliSecondsSinceUnixEpoch::now);
 
         let content = TimelineItemContent::from_event(room, event).await?;
@@ -225,7 +249,7 @@ mod tests {
     use eyeball_im::VectorDiff;
     use matrix_sdk::test_utils::mocks::MatrixMockServer;
     use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
-    use ruma::{event_id, room_id, user_id};
+    use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id, user_id};
     use strass::assert_let;
     use stream_assert::{assert_next_matches, assert_pending};
     use tokio::time::sleep;
@@ -281,6 +305,91 @@ mod tests {
         assert_pending!(results_stream);
         assert_eq!(search.pagination_state(), PaginationState::Idle { end_reached: true });
         assert_eq!(search.results().await.len(), 1);
+    }
+
+    #[async_test]
+    async fn test_edit_hit_resolves_to_the_original_event_id() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!room:localhost");
+        let original_event_id = event_id!("$original:localhost");
+        let edit_event_id = event_id!("$edit:localhost");
+        let f = EventFactory::new().sender(user_id!("@user:localhost"));
+
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_joined_room(
+                    JoinedRoomBuilder::new(room_id)
+                        .add_timeline_event(
+                            f.text_msg("hello").room(room_id).event_id(original_event_id),
+                        )
+                        .add_timeline_event(
+                            f.text_msg("* edited").room(room_id).event_id(edit_event_id).edit(
+                                original_event_id,
+                                RoomMessageEventContent::text_plain("edited").into(),
+                            ),
+                        ),
+                );
+            })
+            .await;
+
+        // Let the indexer process the events.
+        sleep(Duration::from_millis(300)).await;
+
+        let search = SearchService::new(client);
+
+        // Only the edit contains this word, so the hit is the edit event.
+        search.set_query("edited".to_owned()).await.unwrap();
+
+        let results = search.results().await;
+        assert_eq!(results.len(), 1);
+        assert_let!(ResultType::Message(message) = &results[0]);
+        assert_eq!(message.event_id, original_event_id);
+    }
+
+    #[async_test]
+    async fn test_edit_and_original_hits_are_deduplicated() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!room:localhost");
+        let original_event_id = event_id!("$original:localhost");
+        let edit_event_id = event_id!("$edit:localhost");
+        let f = EventFactory::new().sender(user_id!("@user:localhost"));
+
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_joined_room(
+                    JoinedRoomBuilder::new(room_id)
+                        .add_timeline_event(
+                            f.text_msg("hey there").room(room_id).event_id(original_event_id),
+                        )
+                        .add_timeline_event(
+                            f.text_msg("* hey all").room(room_id).event_id(edit_event_id).edit(
+                                original_event_id,
+                                RoomMessageEventContent::text_plain("hey all").into(),
+                            ),
+                        ),
+                );
+            })
+            .await;
+
+        // Let the indexer process the events.
+        sleep(Duration::from_millis(300)).await;
+
+        let search = SearchService::new(client);
+
+        // Both the original message and its edit contain this word, but they
+        // are the same message, so there must be a single result.
+        search.set_query("hey".to_owned()).await.unwrap();
+
+        let results = search.results().await;
+        assert_eq!(results.len(), 1);
+        assert_let!(ResultType::Message(message) = &results[0]);
+        assert_eq!(message.event_id, original_event_id);
     }
 
     #[async_test]
