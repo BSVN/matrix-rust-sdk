@@ -10,6 +10,7 @@ mod chunk_iterator;
 mod client;
 mod client_builder;
 mod content_scanner;
+mod device_info;
 mod encryption;
 mod error;
 mod event;
