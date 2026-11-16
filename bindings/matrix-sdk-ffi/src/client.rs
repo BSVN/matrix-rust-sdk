@@ -31,7 +31,7 @@ use matrix_sdk::{
         ClientId, OAuthAuthorizationData, OAuthError as SdkOAuthError, OAuthSession,
     },
     deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
-    event_cache::SearchBackfillStrategy,
+    event_cache::{RoomBackfillRun, SearchBackfillPriority, SearchBackfillStrategy},
     executor::AbortOnDrop,
     media::{
         DefaultMediaFetcher, MediaFormat, MediaRequestParameters, MediaRetentionPolicy,
@@ -2589,6 +2589,77 @@ impl Client {
         })))
     }
 
+    /// Back-paginate a single room to populate the search index.
+    ///
+    /// Runs for at most `max_batches` batches (30 events each) at the given
+    /// priority. Call it again while the returned status is `MoreToLoad`,
+    /// until it returns `ReachedStart`.
+    ///
+    /// Requires `ClientBuilder::enable_automatic_back_pagination` and
+    /// `ClientBuilder::enable_event_cache`, otherwise the status is `Failed`.
+    pub async fn index_room_history(
+        &self,
+        room_id: String,
+        priority: SearchBackfillPriority,
+        max_batches: u32,
+    ) -> Result<RoomBackfillRun, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        let event_cache = self
+            .inner
+            .event_cache()
+            .ok_or_else(|| ClientError::from(anyhow::anyhow!("the event cache is not enabled")))?;
+
+        Ok(event_cache.backfill_room_history(&room_id, priority, max_batches as usize).await)
+    }
+
+    /// What is known about the search index of a room: how many of its
+    /// messages a search can find. A room that was never indexed has none.
+    #[cfg(feature = "experimental-search")]
+    pub async fn room_index_stats(&self, room_id: String) -> Result<RoomIndexStats, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        let indexed_count = self
+            .inner
+            .search_index()
+            .lock()
+            .await
+            .indexed_count(&room_id)
+            .map_err(|err| ClientError::from(anyhow::anyhow!("{err}")))?;
+
+        Ok(RoomIndexStats { indexed_count })
+    }
+
+    /// What is known about the messages of a room that couldn't be
+    /// decrypted, so a search can't find them: how many they are, and the
+    /// ranges of consecutive ones, from the oldest to the newest.
+    ///
+    /// `message_count` counts the messages of the event cache store of the
+    /// room, and can differ from the sum of the ranges: the events that the
+    /// room cache doesn't hold in its chunks, such as some pinned or thread
+    /// events, are counted but belong to no range.
+    ///
+    /// Requires `ClientBuilder::enable_event_cache`, otherwise it fails.
+    pub async fn room_undecrypted_info(
+        &self,
+        room_id: String,
+    ) -> Result<RoomUndecryptedInfo, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        let event_cache = self
+            .inner
+            .event_cache()
+            .ok_or_else(|| ClientError::from(anyhow::anyhow!("the event cache is not enabled")))?;
+
+        let message_count = event_cache.count_undecrypted_messages(&room_id).await?;
+        let ranges = event_cache.undecrypted_ranges(&room_id).await?;
+
+        Ok(RoomUndecryptedInfo {
+            message_count,
+            ranges: ranges.into_iter().map(Into::into).collect(),
+        })
+    }
+
     pub fn homeserver_capabilities(&self) -> HomeserverCapabilities {
         HomeserverCapabilities::new(self.inner.homeserver_capabilities())
     }
@@ -3069,6 +3140,94 @@ impl From<NotificationProcessSetup> for MatrixNotificationProcessSetup {
 }
 
 /// Information about a room, that was resolved from a room alias.
+/// What is known about the search index of a room.
+#[derive(uniffi::Record)]
+pub struct RoomIndexStats {
+    /// The number of messages a search can find in the room.
+    pub indexed_count: u64,
+}
+
+/// What is known about the messages of a room that couldn't be decrypted.
+#[derive(uniffi::Record)]
+pub struct RoomUndecryptedInfo {
+    /// The number of messages that couldn't be decrypted.
+    pub message_count: u64,
+    /// The ranges of consecutive messages that couldn't be decrypted, from
+    /// the oldest to the newest.
+    pub ranges: Vec<UndecryptedRangeInfo>,
+}
+
+/// A run of consecutive messages of a room that couldn't be decrypted.
+#[derive(uniffi::Record)]
+pub struct UndecryptedRangeInfo {
+    /// The event id of the oldest message of the range.
+    pub first_event_id: String,
+    /// The event id of the newest message of the range.
+    pub last_event_id: String,
+    /// The number of messages in the range.
+    pub message_count: u64,
+    /// The timestamp of the oldest message of the range, in milliseconds
+    /// since the Unix epoch, if known.
+    pub first_event_timestamp: Option<u64>,
+    /// The timestamp of the newest message of the range, in milliseconds
+    /// since the Unix epoch, if known.
+    pub last_event_timestamp: Option<u64>,
+}
+
+impl From<matrix_sdk::event_cache::UndecryptedRange> for UndecryptedRangeInfo {
+    fn from(range: matrix_sdk::event_cache::UndecryptedRange) -> Self {
+        Self {
+            first_event_id: range.first_event_id.to_string(),
+            last_event_id: range.last_event_id.to_string(),
+            message_count: range.message_count,
+            first_event_timestamp: range.first_event_timestamp,
+            last_event_timestamp: range.last_event_timestamp,
+        }
+    }
+}
+
+#[cfg(test)]
+mod undecrypted_range_info_tests {
+    use matrix_sdk::{event_cache::UndecryptedRange, ruma::event_id};
+
+    use super::UndecryptedRangeInfo;
+
+    #[test]
+    fn test_range_is_converted_for_the_bindings() {
+        let range = UndecryptedRange {
+            first_event_id: event_id!("$1:example.org").to_owned(),
+            last_event_id: event_id!("$2:example.org").to_owned(),
+            message_count: 7,
+            first_event_timestamp: Some(1_000),
+            last_event_timestamp: Some(2_000),
+        };
+
+        let info = UndecryptedRangeInfo::from(range);
+
+        assert_eq!(info.first_event_id, "$1:example.org");
+        assert_eq!(info.last_event_id, "$2:example.org");
+        assert_eq!(info.message_count, 7);
+        assert_eq!(info.first_event_timestamp, Some(1_000));
+        assert_eq!(info.last_event_timestamp, Some(2_000));
+    }
+
+    #[test]
+    fn test_unknown_timestamps_stay_unknown_for_the_bindings() {
+        let range = UndecryptedRange {
+            first_event_id: event_id!("$1:example.org").to_owned(),
+            last_event_id: event_id!("$1:example.org").to_owned(),
+            message_count: 1,
+            first_event_timestamp: None,
+            last_event_timestamp: None,
+        };
+
+        let info = UndecryptedRangeInfo::from(range);
+
+        assert_eq!(info.first_event_timestamp, None);
+        assert_eq!(info.last_event_timestamp, None);
+    }
+}
+
 #[derive(uniffi::Record)]
 pub struct ResolvedRoomAlias {
     /// The room ID that the alias resolved to.

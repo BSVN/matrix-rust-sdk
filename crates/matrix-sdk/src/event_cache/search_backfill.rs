@@ -18,10 +18,18 @@
 //! Requests go on the shared [`BackPaginationQueue`] at the lowest priority, so
 //! reactive work (latest event, read receipts) always takes precedence.
 
-use std::{collections::HashSet, ops::ControlFlow, time::Duration};
+use std::{
+    collections::HashSet,
+    ops::ControlFlow,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use matrix_sdk_base::sleep::sleep;
-use ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, time::Instant};
+use ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId, time::Instant};
 use tracing::{debug, info, trace, warn};
 
 use super::{
@@ -294,6 +302,175 @@ fn oldest_event_timestamp(outcome: &BackPaginationOutcome) -> Option<MilliSecond
 /// an event never satisfies an age-based stop condition.
 fn age_of(ts: MilliSecondsSinceUnixEpoch) -> Option<Duration> {
     ts.to_system_time()?.elapsed().ok()
+}
+
+/// Priority of a per-room search backfill run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum SearchBackfillPriority {
+    /// Background work, e.g. the user just opened the room.
+    Low,
+    /// Urgent work, e.g. the user is searching in a room that isn't fully
+    /// indexed yet.
+    High,
+}
+
+/// How a per-room search backfill run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum RoomBackfillStatus {
+    /// The whole room history was paginated (and therefore indexed).
+    ReachedStart,
+    /// The batch budget ran out: call again to continue.
+    MoreToLoad,
+    /// Nothing to load right now (e.g. a gap without a token yet).
+    NoData,
+    /// The room has no messages worth indexing (a space) or the user isn't
+    /// joined to it. Retrying won't change anything.
+    Skipped,
+    /// The run failed (network error, search backfill disabled, ...).
+    Failed,
+    /// The run was cancelled.
+    Cancelled,
+}
+
+/// The result of a per-room search backfill run.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RoomBackfillRun {
+    /// How the run ended.
+    pub status: RoomBackfillStatus,
+    /// Number of events loaded by this run.
+    pub events_loaded: u32,
+    /// Timestamp (ms since the Unix epoch) of the oldest event seen by this
+    /// run, if any.
+    pub oldest_event_ts: Option<u64>,
+}
+
+/// How long a room stays loaded in the event cache after a per-room backfill
+/// run that left more history to load.
+///
+/// The back-pagination queue subscribes to the room only for the duration of a
+/// run, and the room is auto-shrunk to its last chunk when the last subscriber
+/// goes away. The next run would then restart from the most recent chunk and
+/// spend all its batches re-reading history that is already stored, never
+/// getting past it. Keeping the room loaded between two consecutive runs of the
+/// same indexing avoids that; the room is shrunk once the indexing is idle.
+const KEEP_ROOM_LOADED_BETWEEN_RUNS: Duration = Duration::from_secs(120);
+
+impl EventCache {
+    /// Back-paginate a single room for at most `max_batches` batches, at the
+    /// given priority and without any age floor.
+    ///
+    /// Events loaded this way flow through the event cache, so they get
+    /// indexed by the search indexing task like any other event.
+    ///
+    /// Call it again while the status is [`RoomBackfillStatus::MoreToLoad`],
+    /// until it returns [`RoomBackfillStatus::ReachedStart`]. Each run is
+    /// bounded, so a later [`SearchBackfillPriority::High`] request for the
+    /// same room only waits for the current run to end (runs are never
+    /// preempted).
+    ///
+    /// Returns [`RoomBackfillStatus::Failed`] if automatic back-pagination
+    /// is disabled.
+    pub async fn backfill_room_history(
+        &self,
+        room_id: &RoomId,
+        priority: SearchBackfillPriority,
+        max_batches: usize,
+    ) -> RoomBackfillRun {
+        let failed = RoomBackfillRun {
+            status: RoomBackfillStatus::Failed,
+            events_loaded: 0,
+            oldest_event_ts: None,
+        };
+
+        let Some(queue) = self.back_pagination_queue() else {
+            return failed;
+        };
+
+        // Keep the room loaded for this run, and for a while after it if there
+        // is more to load (see `KEEP_ROOM_LOADED_BETWEEN_RUNS`).
+        let keep_loaded = self.subscribe_to_keep_room_loaded(room_id).await;
+
+        let loaded = Arc::new(AtomicU32::new(0));
+        let oldest = Arc::new(AtomicU64::new(u64::MAX));
+
+        let loaded_writer = loaded.clone();
+        let oldest_writer = oldest.clone();
+
+        let request = BackPaginationRequest {
+            room_id: room_id.to_owned(),
+            priority: match priority {
+                SearchBackfillPriority::Low => Priority::Low,
+                SearchBackfillPriority::High => Priority::High,
+            },
+            // Never stops on its own: it is bounded by `max_batches` and by the
+            // start of the timeline. It only records some statistics.
+            stop: Box::new(move |outcome| {
+                loaded_writer.fetch_add(outcome.events.len() as u32, Ordering::Relaxed);
+
+                if let Some(ts) = oldest_event_timestamp(outcome) {
+                    oldest_writer.fetch_min(u64::from(ts.get()), Ordering::Relaxed);
+                }
+
+                ControlFlow::Continue(())
+            }),
+            batch_size: BATCH_SIZE,
+            max_batches: Some(max_batches.max(1)),
+        };
+
+        let handle = match queue.enqueue(request) {
+            Ok(handle) => handle,
+            Err(err) => {
+                warn!(%room_id, "couldn't enqueue a room search backfill request: {err}");
+                return failed;
+            }
+        };
+
+        let status = match handle.join().await.reason {
+            BackPaginationStopReason::ReachedTimelineStart => RoomBackfillStatus::ReachedStart,
+            BackPaginationStopReason::BatchLimitReached
+            | BackPaginationStopReason::StopConditionMet => RoomBackfillStatus::MoreToLoad,
+            BackPaginationStopReason::NoDataAvailable => RoomBackfillStatus::NoData,
+            BackPaginationStopReason::Skipped => RoomBackfillStatus::Skipped,
+            BackPaginationStopReason::Failed => RoomBackfillStatus::Failed,
+            BackPaginationStopReason::Cancelled => RoomBackfillStatus::Cancelled,
+        };
+
+        if status == RoomBackfillStatus::MoreToLoad
+            && let Some(keep_loaded) = keep_loaded
+        {
+            // The next run of this indexing will most likely start soon.
+            // Release the room later, from a detached task.
+            matrix_sdk_common::executor::spawn(async move {
+                sleep(KEEP_ROOM_LOADED_BETWEEN_RUNS).await;
+                drop(keep_loaded);
+            });
+        }
+
+        let oldest = oldest.load(Ordering::Relaxed);
+
+        RoomBackfillRun {
+            status,
+            events_loaded: loaded.load(Ordering::Relaxed),
+            oldest_event_ts: (oldest != u64::MAX).then_some(oldest),
+        }
+    }
+}
+
+impl EventCache {
+    /// Subscribe to the room, to prevent it from being auto-shrunk for as long
+    /// as the returned value is alive. Returns `None` if the room has no
+    /// caches.
+    async fn subscribe_to_keep_room_loaded(
+        &self,
+        room_id: &RoomId,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        let room = self.inner.all_caches_for_room(room_id).await.ok()?.room().clone();
+        let (_events, subscriber) = room.subscribe().await.ok()?;
+        Some(Box::new(subscriber))
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

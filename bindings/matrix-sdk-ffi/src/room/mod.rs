@@ -1420,6 +1420,25 @@ impl Room {
             .into())
     }
 
+    /// The ID of the first event of the room at or after the given timestamp
+    /// (in milliseconds since the Unix epoch), asked to the homeserver.
+    ///
+    /// Given the start of a day, it is the first event of that day. It fails
+    /// if the homeserver does not support the `timestamp_to_event` endpoint.
+    pub async fn event_id_at_or_after_timestamp(
+        &self,
+        timestamp_ms: u64,
+    ) -> Result<String, ClientError> {
+        let timestamp = ruma::MilliSecondsSinceUnixEpoch(
+            ruma::UInt::try_from(timestamp_ms).unwrap_or(ruma::UInt::MAX),
+        );
+        let (event_id, _) = self
+            .inner
+            .event_id_for_timestamp(timestamp, ruma::api::Direction::Forward, None)
+            .await?;
+        Ok(event_id.to_string())
+    }
+
     /// Either loads the event associated with the `event_id` from the event
     /// cache or fetches it from the homeserver, along with the events related
     /// to it (e.g. reactions and edits), fetched recursively.
