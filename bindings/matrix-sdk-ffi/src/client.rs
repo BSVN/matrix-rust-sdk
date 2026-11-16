@@ -1472,9 +1472,37 @@ impl Client {
     }
 
     /// Fetch the list of devices (sessions) of the current account from the homeserver.
+    ///
+    /// The verification state of each device is read from the local crypto store.
+    /// A device the store does not know, or a failed lookup, is reported as `Unknown`.
     pub async fn devices(&self) -> Result<Vec<crate::device_info::DeviceInfo>, ClientError> {
         let response = self.inner.devices().await?;
-        Ok(response.devices.into_iter().map(Into::into).collect())
+        let encryption = self.inner.encryption();
+        let own_user_id = self.inner.user_id().map(ToOwned::to_owned);
+
+        let mut devices = Vec::with_capacity(response.devices.len());
+        for device in response.devices {
+            let verification_state = match &own_user_id {
+                Some(user_id) => {
+                    // A failed lookup must not fail the whole list.
+                    let is_verified = encryption
+                        .get_device(user_id, &device.device_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|found| found.is_verified());
+                    crate::device_info::DeviceVerificationState::from_lookup(is_verified)
+                }
+                None => crate::device_info::DeviceVerificationState::Unknown,
+            };
+
+            devices.push(
+                crate::device_info::DeviceInfo::from(device)
+                    .with_verification_state(verification_state),
+            );
+        }
+
+        Ok(devices)
     }
 
     pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
